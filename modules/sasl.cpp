@@ -16,6 +16,11 @@
 
 #include <znc/IRCNetwork.h>
 #include <znc/IRCSock.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
 
 static const struct {
 	const char *szName;
@@ -24,8 +29,137 @@ static const struct {
 } SupportedMechanisms[] = {
 	{ "EXTERNAL",           "TLS certificate, for use with the *cert module", false },
 	{ "PLAIN",              "Plain text negotiation, this should work always if the network supports SASL", true },
+	{ "ECDSA-NIST256P-CHALLENGE", "ECDSA public key authentication.", true },
 	{ NULL, NULL, false }
 };
+
+class ECDACommon {
+    private:
+        EC_KEY *key;
+        bool loaded;
+
+    public:
+    ECDACommon() {
+        key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+        EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
+        loaded = false;
+    }
+
+    ~ECDACommon() {
+        if (key)
+            EC_KEY_free(key);
+    }
+
+    /* Generate an ECC keypair suitable for authentication. */
+    void GenerateKey(void) {
+        EC_KEY_generate_key(key);
+        loaded = true;
+    }
+
+    /* Get base64 encoded private key from key */
+    CString GetPubBase64(void) {
+        CString ret;
+		size_t keybuflen;
+        unsigned char *keybuf;
+
+        if (!loaded)
+            return ret;
+
+        keybuflen = (size_t) i2o_ECPublicKey(key, NULL);
+        keybuf = (unsigned char *)malloc(keybuflen);
+        if(!keybuf)
+            return ret;
+
+        if(!i2o_ECPublicKey(key, &keybuf)) {
+            free(keybuf);
+            return ret;
+        }
+        /* for some reason keybuf is at the end now ?! */
+        keybuf -= keybuflen;
+
+        ret = CString((char *)keybuf, keybuflen);
+        ret.Base64Encode();
+
+        free(keybuf);
+        return ret;
+    }
+
+    CString GetPrivBase64(void) {
+        CString ret;
+		size_t keybuflen;
+        char *keybuf;
+		FILE *keyfile;
+
+        if(!loaded)
+            return ret;
+
+		keyfile = open_memstream(&keybuf, &keybuflen);
+		if(keyfile == NULL)
+            return ret;
+
+		PEM_write_ECPrivateKey(keyfile, key, NULL, NULL, 0, NULL, NULL);
+		fclose(keyfile);
+
+		ret = CString(keybuf, keybuflen);
+        ret.Base64Encode();
+        return ret;
+    }
+
+    /* returns false if key fails to parse */
+    bool LoadKey(const CString& sKey) {
+		FILE *keyfile;
+        CString bytes;
+        bytes = sKey.Base64Decode_n();
+
+		keyfile = fmemopen((void *)bytes.c_str(), bytes.size(), "r");
+
+		if(keyfile == NULL) {
+			loaded = false;
+            return loaded;
+        }
+
+		PEM_read_ECPrivateKey(keyfile, &key, NULL, NULL);
+		fclose(keyfile);
+
+		EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
+
+		if(!EC_KEY_check_key(key))
+            loaded = false;
+        else
+            loaded = true;
+
+        return loaded;
+    }
+
+    CString Sign(const CString& challenge) {
+        CString ret;
+        CString ch;
+        unsigned char *sigbuf;
+        unsigned int siglen;
+
+        if (!loaded)
+            return ret;
+
+        siglen = ECDSA_size(key);
+        sigbuf = (unsigned char *)malloc(siglen);
+        if(!sigbuf)
+            return ret;
+
+        ch = challenge.Base64Decode_n();
+
+        if (!ECDSA_sign(0, (unsigned char *)ch.c_str(), ch.size(), sigbuf, &siglen, key)) {
+            free(sigbuf);
+            return ret;
+        }
+
+        ret = CString((char *)sigbuf, siglen);
+        ret.Base64Encode();
+
+        return ret;
+    }
+
+};
+
 
 #define NV_REQUIRE_AUTH     "require_auth"
 #define NV_MECHANISMS       "mechanisms"
@@ -75,8 +209,13 @@ public:
 			"[mechanism[ ...]]", "Set the mechanisms to be attempted (in order)");
 		AddCommand("RequireAuth", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::RequireAuthCommand),
 			"[yes|no]", "Don't connect unless SASL authentication succeeds");
+		AddCommand("GenerateKey", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::GenerateKey),
+			"", "Generate a key to use for ECDSA-NIST256P-CHALLENGE authentication");
+		AddCommand("ShowKey", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::ShowKey),
+			"", "Prints base64 encoded key for ECDSA-NIST256P-CHALLENGE authentication");
 
 		m_bAuthenticated = false;
+		m_bStartedECDSA = false;
 	}
 
 	void PrintHelp(const CString& sLine) {
@@ -103,6 +242,7 @@ public:
 		PutModule("Username has been set to [" + GetNV("username") + "]");
 		PutModule("Password has been set to [" + GetNV("password") + "]");
 	}
+
 
 	void SetMechanismCommand(const CString& sLine) {
 		CString sMechanisms = sLine.Token(1, true).AsUpper();
@@ -177,11 +317,56 @@ public:
 		return false;
 	}
 
+
+
+	void GenerateKey(const CString& sLine) {
+        ECDACommon ec;
+        CString key;
+
+        ec.GenerateKey();
+        key = ec.GetPrivBase64();
+		SetNV("ecdsaprivkey", key);
+        key = ec.GetPubBase64();
+		PutModule("New public key " + key + " generated");
+	}
+
+	void ShowKey(const CString& sLine) {
+        ECDACommon ec;
+
+        if(!ec.LoadKey(GetNV("ecdsaprivkey")))
+            PutModule("No valid public key found");
+        else
+            PutModule("Public key: " + ec.GetPubBase64());
+	}
+
+
+	void AuthenticateECDSA(const CString& sLine) {
+        ECDACommon ec;
+
+		/* First call we just send username */
+		if(!m_bStartedECDSA) {
+			PutIRC("AUTHENTICATE " + GetNV("username").Base64Encode_n());
+			m_bStartedECDSA = true;
+			return;
+		}
+
+		m_bStartedECDSA = false;
+
+        /* Load key then sign and send */
+        if(!ec.LoadKey(GetNV("ecdsaprivkey"))) {
+            PutModule("No valid public key found");
+            return;
+        }
+		PutIRC("AUTHENTICATE " + ec.Sign(sLine));
+	}
+
 	void Authenticate(const CString& sLine) {
 		if (m_Mechanisms.GetCurrent().Equals("PLAIN") && sLine.Equals("+")) {
 			CString sAuthLine = GetNV("username") + '\0' + GetNV("username")  + '\0' + GetNV("password");
 			sAuthLine.Base64Encode();
 			PutIRC("AUTHENTICATE " + sAuthLine);
+		} else if (m_Mechanisms.GetCurrent().Equals("ECDSA-NIST256P-CHALLENGE")) {
+			AuthenticateECDSA(sLine);
 		} else {
 			/* Send blank authenticate for other mechanisms (like EXTERNAL). */
 			PutIRC("AUTHENTICATE +");
@@ -205,6 +390,7 @@ public:
 				GetNetwork()->GetIRCSock()->PauseCap();
 
 				m_Mechanisms.SetIndex(0);
+				m_bStartedECDSA = false;
 				PutIRC("AUTHENTICATE " + m_Mechanisms.GetCurrent());
 			} else {
 				CheckRequireAuth();
@@ -255,10 +441,12 @@ public:
 
 	virtual void OnIRCDisconnected() override {
 		m_bAuthenticated = false;
+		m_bStartedECDSA = false;
 	}
 private:
 	Mechanisms m_Mechanisms;
 	bool m_bAuthenticated;
+	bool m_bStartedECDSA;
 };
 
 template<> void TModInfo<CSASLMod>(CModInfo& Info) {
