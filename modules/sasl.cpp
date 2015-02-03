@@ -16,11 +16,14 @@
 
 #include <znc/IRCNetwork.h>
 #include <znc/IRCSock.h>
+
+#ifdef HAVE_LIBSSL
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#endif //HAVESSL
 
 static const struct {
 	const char *szName;
@@ -29,10 +32,13 @@ static const struct {
 } SupportedMechanisms[] = {
 	{ "EXTERNAL",           "TLS certificate, for use with the *cert module", false },
 	{ "PLAIN",              "Plain text negotiation, this should work always if the network supports SASL", true },
+#ifdef HAVE_LIBSSL
 	{ "ECDSA-NIST256P-CHALLENGE", "ECDSA public key authentication.", true },
+#endif
 	{ NULL, NULL, false }
 };
 
+#ifdef HAVE_LIBSSL
 class ECDACommon {
     private:
         EC_KEY *key;
@@ -159,6 +165,7 @@ class ECDACommon {
     }
 
 };
+#endif //HAVE_LIBSSL
 
 
 #define NV_REQUIRE_AUTH     "require_auth"
@@ -209,13 +216,15 @@ public:
 			"[mechanism[ ...]]", "Set the mechanisms to be attempted (in order)");
 		AddCommand("RequireAuth", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::RequireAuthCommand),
 			"[yes|no]", "Don't connect unless SASL authentication succeeds");
+#ifdef HAVE_LIBSSL
 		AddCommand("GenerateKey", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::GenerateKey),
 			"", "Generate a key to use for ECDSA-NIST256P-CHALLENGE authentication");
 		AddCommand("ShowKey", static_cast<CModCommand::ModCmdFunc>(&CSASLMod::ShowKey),
 			"", "Prints base64 encoded key for ECDSA-NIST256P-CHALLENGE authentication");
+#endif
 
-		m_bAuthenticated = false;
 		m_bStartedECDSA = false;
+		m_bAuthenticated = false;
 	}
 
 	void PrintHelp(const CString& sLine) {
@@ -317,8 +326,7 @@ public:
 		return false;
 	}
 
-
-
+#ifdef HAVE_LIBSSL
 	void GenerateKey(const CString& sLine) {
         ECDACommon ec;
         CString key;
@@ -359,14 +367,17 @@ public:
         }
 		PutIRC("AUTHENTICATE " + ec.Sign(sLine));
 	}
+#endif
 
 	void Authenticate(const CString& sLine) {
 		if (m_Mechanisms.GetCurrent().Equals("PLAIN") && sLine.Equals("+")) {
 			CString sAuthLine = GetNV("username") + '\0' + GetNV("username")  + '\0' + GetNV("password");
 			sAuthLine.Base64Encode();
 			PutIRC("AUTHENTICATE " + sAuthLine);
+#ifdef HAVE_LIBSSL
 		} else if (m_Mechanisms.GetCurrent().Equals("ECDSA-NIST256P-CHALLENGE")) {
 			AuthenticateECDSA(sLine);
+#endif
 		} else {
 			/* Send blank authenticate for other mechanisms (like EXTERNAL). */
 			PutIRC("AUTHENTICATE +");
