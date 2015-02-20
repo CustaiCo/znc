@@ -40,89 +40,65 @@ static const struct {
 
 #ifdef HAVE_LIBSSL
 class ECDACommon {
-    private:
-        EC_KEY *key;
-        bool loaded;
+	private:
+		EC_KEY *key;
+		bool loaded;
 
-    public:
-    ECDACommon() {
-        key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-        EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
-        loaded = false;
-    }
+	public:
+	ECDACommon() {
+		key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+		EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
+		loaded = false;
+	    }
 
-    ~ECDACommon() {
-        if (key)
-            EC_KEY_free(key);
-    }
+	~ECDACommon() {
+		if (key)
+		    EC_KEY_free(key);
+	}
 
-    /* Generate an ECC keypair suitable for authentication. */
-    void GenerateKey(void) {
-        EC_KEY_generate_key(key);
-        loaded = true;
-    }
+	/* Generate an ECC keypair suitable for authentication. */
+	void GenerateKey(void) {
+		EC_KEY_generate_key(key);
+		loaded = true;
+	}
 
-    /* Get base64 encoded private key from key */
-    CString GetPubBase64(void) {
-        CString ret;
+	/* Get base64 encoded private key from key */
+	CString GetPubBase64(void) {
+		CString ret;
 		size_t keybuflen;
-        unsigned char *keybuf;
+		unsigned char *keybuf;
 
-        if (!loaded)
-            return ret;
+		if (!loaded)
+		    return ret;
 
-        keybuflen = (size_t) i2o_ECPublicKey(key, NULL);
-        keybuf = (unsigned char *)malloc(keybuflen);
-        if(!keybuf)
-            return ret;
+		keybuflen = (size_t) i2o_ECPublicKey(key, NULL);
+		keybuf = (unsigned char *)malloc(keybuflen);
+		if(!keybuf)
+		    return ret;
 
-        if(!i2o_ECPublicKey(key, &keybuf)) {
-            free(keybuf);
-            return ret;
-        }
-        /* for some reason keybuf is at the end now ?! */
-        keybuf -= keybuflen;
+		if(!i2o_ECPublicKey(key, &keybuf)) {
+		    free(keybuf);
+		    return ret;
+		}
+		/* for some reason keybuf is at the end now ?! */
+		keybuf -= keybuflen;
 
-        ret = CString((char *)keybuf, keybuflen);
-        ret.Base64Encode();
+		ret = CString((char *)keybuf, keybuflen);
+		ret.Base64Encode();
 
-        free(keybuf);
-        return ret;
-    }
+		free(keybuf);
+		return ret;
+	}
 
-    CString GetPrivBase64(void) {
-        CString ret;
-		size_t keybuflen;
-        char *keybuf;
+	/* returns false if key fails to parse */
+	bool LoadKey(const CString& sPath) {
 		FILE *keyfile;
-
-        if(!loaded)
-            return ret;
-
-		keyfile = open_memstream(&keybuf, &keybuflen);
-		if(keyfile == NULL)
-            return ret;
-
-		PEM_write_ECPrivateKey(keyfile, key, NULL, NULL, 0, NULL, NULL);
-		fclose(keyfile);
-
-		ret = CString(keybuf, keybuflen);
-        ret.Base64Encode();
-        return ret;
-    }
-
-    /* returns false if key fails to parse */
-    bool LoadKey(const CString& sKey) {
-		FILE *keyfile;
-        CString bytes;
-        bytes = sKey.Base64Decode_n();
-
-		keyfile = fmemopen((void *)bytes.c_str(), bytes.size(), "r");
-
+		CString path = sPath + "/sasl.pem";
+		keyfile = fopen(path.c_str(), "r");
 		if(keyfile == NULL) {
 			loaded = false;
-            return loaded;
-        }
+			return loaded;
+		}
 
 		PEM_read_ECPrivateKey(keyfile, &key, NULL, NULL);
 		fclose(keyfile);
@@ -130,38 +106,51 @@ class ECDACommon {
 		EC_KEY_set_conv_form(key, POINT_CONVERSION_COMPRESSED);
 
 		if(!EC_KEY_check_key(key))
-            loaded = false;
-        else
-            loaded = true;
+			loaded = false;
+		else
+			loaded = true;
 
-        return loaded;
-    }
+		return loaded;
+	    }
 
-    CString Sign(const CString& challenge) {
-        CString ret;
-        CString ch;
-        unsigned char *sigbuf;
-        unsigned int siglen;
+	bool SaveKey(const CString& sPath) {
+		FILE *keyfile;
+		CString path = sPath + "/sasl.pem";
+		if(!loaded)
+			return loaded;
+		keyfile = fopen(path.c_str(), "w");
+		if(keyfile == NULL)
+			return false;
+		PEM_write_ECPrivateKey(keyfile, key, NULL, NULL, 0, NULL, NULL);
+		fclose(keyfile);
+		return true;
+	}
 
-        if (!loaded)
-            return ret;
+	CString Sign(const CString& challenge) {
+		CString ret;
+		CString ch;
+		unsigned char *sigbuf;
+		unsigned int siglen;
 
-        siglen = ECDSA_size(key);
-        sigbuf = (unsigned char *)malloc(siglen);
-        if(!sigbuf)
-            return ret;
+		if (!loaded)
+			return ret;
 
-        ch = challenge.Base64Decode_n();
+		siglen = ECDSA_size(key);
+		sigbuf = (unsigned char *)malloc(siglen);
+		if(!sigbuf)
+			return ret;
 
-        if (!ECDSA_sign(0, (unsigned char *)ch.c_str(), ch.size(), sigbuf, &siglen, key)) {
-            free(sigbuf);
-            return ret;
-        }
+		ch = challenge.Base64Decode_n();
 
-        ret = CString((char *)sigbuf, siglen);
-        ret.Base64Encode();
+		if (!ECDSA_sign(0, (unsigned char *)ch.c_str(), ch.size(), sigbuf, &siglen, key)) {
+			free(sigbuf);
+			return ret;
+		}
 
-        return ret;
+		ret = CString((char *)sigbuf, siglen);
+		ret.Base64Encode();
+
+		return ret;
     }
 
 };
@@ -328,28 +317,27 @@ public:
 
 #ifdef HAVE_LIBSSL
 	void GenerateKey(const CString& sLine) {
-        ECDACommon ec;
-        CString key;
+		ECDACommon ec;
+		CString key;
 
-        ec.GenerateKey();
-        key = ec.GetPrivBase64();
-		SetNV("ecdsaprivkey", key);
-        key = ec.GetPubBase64();
+		ec.GenerateKey();
+		ec.SaveKey(GetSavePath());
+		key = ec.GetPubBase64();
 		PutModule("New public key " + key + " generated");
 	}
 
 	void ShowKey(const CString& sLine) {
-        ECDACommon ec;
+		ECDACommon ec;
 
-        if(!ec.LoadKey(GetNV("ecdsaprivkey")))
-            PutModule("No valid public key found");
-        else
-            PutModule("Public key: " + ec.GetPubBase64());
+		if(!ec.LoadKey(GetSavePath()))
+			PutModule("No valid public key found");
+		else
+			PutModule("Public key: " + ec.GetPubBase64());
 	}
 
 
 	void AuthenticateECDSA(const CString& sLine) {
-        ECDACommon ec;
+		ECDACommon ec;
 
 		/* First call we just send username */
 		if(!m_bStartedECDSA) {
@@ -357,14 +345,13 @@ public:
 			m_bStartedECDSA = true;
 			return;
 		}
-
 		m_bStartedECDSA = false;
 
-        /* Load key then sign and send */
-        if(!ec.LoadKey(GetNV("ecdsaprivkey"))) {
-            PutModule("No valid public key found");
-            return;
-        }
+		/* Load key then sign and send */
+		if(!ec.LoadKey(GetSavePath())) {
+			PutModule("No valid public key found");
+			return;
+		}
 		PutIRC("AUTHENTICATE " + ec.Sign(sLine));
 	}
 #endif
